@@ -39,9 +39,13 @@ def quantile_of(values, q):
     ordered = sorted(values)
     if not ordered:
         return None
-    position = q * len(ordered)
-    index = min(int(position), len(ordered) - 1)
-    return ordered[index]
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = q * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
 class Sample:
@@ -133,7 +137,7 @@ class MetricWindow:
         if self._now is None or timestamp > self._now:
             self._now = timestamp
             self._expire()
-        if self._size == self._capacity - 1:
+        if self._size >= self._capacity:
             self._drop_oldest()
         self._insert(Sample(timestamp, value, key, self._sequence))
         self._sequence += 1
@@ -142,6 +146,8 @@ class MetricWindow:
     def advance(self, now):
         """把窗口推进到 now，返回因此被丢弃的样本数。"""
         _require_int(now, "时间")
+        if self._now is not None and now < self._now:
+            raise ValueError("时间不能回退: %r < %r" % (now, self._now))
         self._now = now
         return self._expire()
 
@@ -158,7 +164,7 @@ class MetricWindow:
     def mean(self):
         """窗口内样本的平均值。"""
         if self._size == 0:
-            return 0.0
+            return None
         return self.total() / self._size
 
     def delta(self):
@@ -175,10 +181,11 @@ class MetricWindow:
         if self._size < 2:
             return 0.0
         oldest = self._oldest()
-        elapsed = self._now - oldest.timestamp
+        newest = self._newest()
+        elapsed = newest.timestamp - oldest.timestamp
         if elapsed <= 0:
             return 0.0
-        return (self._newest().value - oldest.value) / elapsed
+        return (newest.value - oldest.value) / elapsed
 
     def quantile(self, q):
         """窗口内数值的分位数。"""
@@ -186,7 +193,10 @@ class MetricWindow:
 
     def distinct(self):
         """窗口内样本的去重计数。"""
-        return len({sample.key for sample in self.samples()})
+        keyed = {sample.key for sample in self.samples()
+                 if sample.key is not None}
+        unkeyed = sum(1 for sample in self.samples() if sample.key is None)
+        return len(keyed) + unkeyed
 
     # ---- 内部结构 -------------------------------------------------
 
@@ -211,14 +221,14 @@ class MetricWindow:
             return 0
         dropped = 0
         while (self._size > 0
-               and self._oldest().timestamp < self._now - self._span):
+               and self._oldest().timestamp <= self._now - self._span):
             self._drop_oldest()
             dropped += 1
         return dropped
 
     def _insert(self, sample):
         """把样本放进环形槽位，保持窗口按时间戳有序。"""
-        if self._size == 0 or sample.timestamp >= self._oldest().timestamp:
+        if self._size == 0 or sample.timestamp >= self._newest().timestamp:
             slot = (self._head + self._size) % self._capacity
             self._slots[slot] = sample
             self._size += 1
