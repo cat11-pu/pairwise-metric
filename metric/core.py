@@ -6,10 +6,10 @@
 对外接口：
 
 * Sample        —— 一条样本：时间戳、数值、可选去重键与到达序号；
-* MetricWindow  —— 定长滑动窗口：环形槽位保存样本，过期与超容量的样本
-                   都会被丢弃，对外提供计数、求和、均值、增量、速率、
+* MetricWindow  —— 定长滑动窗口：样本始终按时间戳有序保存，过期与超容量
+                   的样本都会被丢弃，对外提供计数、求和、均值、增量、速率、
                    分位数与去重计数；
-* quantile_of() —— 数值序列的分位数估计。
+* quantile_of() —— 数值序列的分位数估计（线性插值）。
 """
 
 from bisect import bisect_right
@@ -32,16 +32,25 @@ def _require_number(value, label):
 
 
 def quantile_of(values, q):
-    """对数值序列做分位数估计；q 必须落在 0..1 之间。"""
+    """对数值序列做分位数估计；q 必须落在 0..1 之间。
+
+    采用线性插值：位置为 q*(n-1)，q=0 取最小值、q=1 取最大值，
+    结果随 q 单调不减；空序列返回 None。
+    """
     _require_number(q, "分位数")
     if q < 0 or q > 1:
         raise ValueError("分位数必须落在 0..1: %r" % (q,))
     ordered = sorted(values)
     if not ordered:
         return None
-    position = q * len(ordered)
-    index = min(int(position), len(ordered) - 1)
-    return ordered[index]
+    position = q * (len(ordered) - 1)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    fraction = position - lower_index
+    if fraction == 0:
+        return ordered[lower_index]
+    return (ordered[lower_index]
+            + (ordered[upper_index] - ordered[lower_index]) * fraction)
 
 
 class Sample:
@@ -61,10 +70,13 @@ class Sample:
 
 
 class MetricWindow:
-    """定长滑动窗口。"""
+    """定长滑动窗口。
 
-    __slots__ = ("_span", "_capacity", "_slots", "_head", "_size",
-                 "_sequence", "_now")
+    不变量：样本按时间戳非递减有序，且时间戳都落在 (now-span, now] 内；
+    样本数不超过 capacity，超出时丢弃时间戳最旧的样本；now 只增不减。
+    """
+
+    __slots__ = ("_span", "_capacity", "_items", "_sequence", "_now")
 
     def __init__(self, span, capacity):
         _require_int(span, "窗口长度")
@@ -75,9 +87,7 @@ class MetricWindow:
             raise ValueError("窗口容量必须为正: %r" % (capacity,))
         self._span = span
         self._capacity = capacity
-        self._slots = [None] * capacity
-        self._head = 0
-        self._size = 0
+        self._items = []
         self._sequence = 0
         self._now = None
 
@@ -96,35 +106,36 @@ class MetricWindow:
         return self._now
 
     def __len__(self):
-        return self._size
+        return len(self._items)
 
     def __repr__(self):
         return "MetricWindow(span=%d, capacity=%d, size=%d, now=%r)" % (
-            self._span, self._capacity, self._size, self._now)
+            self._span, self._capacity, len(self._items), self._now)
 
     def is_empty(self):
         """窗口里是否已经没有样本。"""
-        return self._size == 0
+        return not self._items
 
     def samples(self):
-        """按窗口顺序返回当前保留的样本。"""
-        return [self._slots[(self._head + index) % self._capacity]
-                for index in range(self._size)]
+        """按时间戳顺序返回当前保留的样本。"""
+        return list(self._items)
 
     def timestamps(self):
         """当前保留样本的时间戳。"""
-        return [sample.timestamp for sample in self.samples()]
+        return [sample.timestamp for sample in self._items]
 
     def values(self):
         """当前保留样本的数值。"""
-        return [sample.value for sample in self.samples()]
+        return [sample.value for sample in self._items]
 
     # ---- 写入 -----------------------------------------------------
 
     def add(self, timestamp, value, key=None):
         """写入一条样本，返回是否被接受。
 
-        时间戳已经落在窗口之外的样本会被直接丢弃。
+        时间戳落在窗口左边界 (now-span] 之外（即 timestamp <= now-span）
+        的样本会被直接拒绝；迟到但仍在窗口内的样本会按时间戳插入到
+        正确位置，窗口始终保持有序。
         """
         _require_int(timestamp, "时间戳")
         _require_number(value, "样本值")
@@ -133,106 +144,94 @@ class MetricWindow:
         if self._now is None or timestamp > self._now:
             self._now = timestamp
             self._expire()
-        if self._size == self._capacity - 1:
-            self._drop_oldest()
-        self._insert(Sample(timestamp, value, key, self._sequence))
+        sample = Sample(timestamp, value, key, self._sequence)
+        index = bisect_right([item.timestamp for item in self._items],
+                             timestamp)
+        self._items.insert(index, sample)
+        if len(self._items) > self._capacity:
+            del self._items[0]
         self._sequence += 1
         return True
 
     def advance(self, now):
-        """把窗口推进到 now，返回因此被丢弃的样本数。"""
+        """把窗口推进到 now，返回因此被丢弃的样本数。
+
+        时间只能向前推进；回退（now 小于当前时间）抛出 ValueError。
+        """
         _require_int(now, "时间")
-        self._now = now
-        return self._expire()
+        if self._now is not None and now < self._now:
+            raise ValueError("时间只能向前推进: %r < %r" % (now, self._now))
+        if self._now is None or now > self._now:
+            self._now = now
+            return self._expire()
+        return 0
 
     # ---- 查询 -----------------------------------------------------
 
     def count(self):
         """窗口内当前保留的样本数。"""
-        return self._size
+        return len(self._items)
 
     def total(self):
         """窗口内样本值之和。"""
-        return sum(self.values())
+        return sum(sample.value for sample in self._items)
 
     def mean(self):
-        """窗口内样本的平均值。"""
-        if self._size == 0:
-            return 0.0
-        return self.total() / self._size
+        """窗口内样本的平均值；空窗口无样本可平均，返回 None。"""
+        if not self._items:
+            return None
+        return self.total() / len(self._items)
 
     def delta(self):
         """最新样本与最旧样本的数值差。"""
-        if self._size == 0:
+        if len(self._items) < 2:
             return 0
-        return self._newest().value - self._oldest().value
+        return self._items[-1].value - self._items[0].value
 
     def rate(self):
         """窗口内数值的单位时间增量。
 
+        分母取最新与最旧样本自身的时间戳之差，与当前窗口时间无关；
         样本少于两条或首尾时间戳相同时返回 0.0。
         """
-        if self._size < 2:
+        if len(self._items) < 2:
             return 0.0
-        oldest = self._oldest()
-        elapsed = self._now - oldest.timestamp
+        oldest = self._items[0]
+        newest = self._items[-1]
+        elapsed = newest.timestamp - oldest.timestamp
         if elapsed <= 0:
             return 0.0
-        return (self._newest().value - oldest.value) / elapsed
+        return (newest.value - oldest.value) / elapsed
 
     def quantile(self, q):
         """窗口内数值的分位数。"""
-        return quantile_of(self.values(), q)
+        return quantile_of((sample.value for sample in self._items), q)
 
     def distinct(self):
-        """窗口内样本的去重计数。"""
-        return len({sample.key for sample in self.samples()})
+        """窗口内样本的去重计数。
+
+        带键样本按键去重；没有去重键的样本各自独立计数，不互相合并。
+        """
+        seen = set()
+        keyless = 0
+        for sample in self._items:
+            if sample.key is None:
+                keyless += 1
+            else:
+                seen.add(sample.key)
+        return len(seen) + keyless
 
     # ---- 内部结构 -------------------------------------------------
 
-    def _oldest(self):
-        return self._slots[self._head]
-
-    def _newest(self):
-        return self._slots[(self._head + self._size - 1) % self._capacity]
-
-    def _drop_oldest(self):
-        if self._size == 0:
-            return None
-        sample = self._slots[self._head]
-        self._slots[self._head] = None
-        self._head = (self._head + 1) % self._capacity
-        self._size -= 1
-        return sample
-
     def _expire(self):
-        """丢弃已经落在窗口之外的样本，返回丢弃条数。"""
-        if self._now is None:
-            return 0
-        dropped = 0
-        while (self._size > 0
-               and self._oldest().timestamp < self._now - self._span):
-            self._drop_oldest()
-            dropped += 1
-        return dropped
-
-    def _insert(self, sample):
-        """把样本放进环形槽位，保持窗口按时间戳有序。"""
-        if self._size == 0 or sample.timestamp >= self._oldest().timestamp:
-            slot = (self._head + self._size) % self._capacity
-            self._slots[slot] = sample
-            self._size += 1
-            return
-        ordered = self.samples()
-        index = bisect_right([item.timestamp for item in ordered],
-                             sample.timestamp)
-        ordered.insert(index, sample)
-        self._rebuild(ordered)
-
-    def _rebuild(self, ordered):
-        """按给定顺序重建环形槽位。"""
-        self._slots = [None] * self._capacity
-        for index, sample in enumerate(ordered):
-            self._slots[index] = sample
-        self._head = 0
-        self._size = len(ordered)
+        """丢弃已经落在窗口之外（timestamp <= now-span）的样本。"""
+        boundary = self._now - self._span
+        keep = 0
+        for sample in self._items:
+            if sample.timestamp <= boundary:
+                keep += 1
+            else:
+                break
+        if keep:
+            del self._items[:keep]
+        return keep
